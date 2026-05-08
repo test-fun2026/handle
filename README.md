@@ -1,116 +1,230 @@
 # handle
 catch (Exception ex) {
-  throw translateTokenizationException(ex);
+
+    throw TokenizationExceptionTranslator.translate(ex);
 }
------
-private SdkException translateTokenizationException(Exception ex) {
+----
 
-    log.error("Tokenization failure", ex);
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.truist.core.common.exception.SdkException;
 
-    // TIMEOUTS
+import lombok.extern.slf4j.Slf4j;
 
-    if (ex instanceof ConnectTimeoutException ||
-        ex instanceof SocketTimeoutException ||
-        ex instanceof ApiCallTimeoutException ||
-        ex instanceof ApiCallAttemptTimeoutException) {
+import org.apache.http.conn.ConnectTimeoutException;
+import org.apache.http.conn.ConnectionPoolTimeoutException;
 
-        return new SdkException(
-                "408",
-                "Timeout while calling tokenization service",
-                "TOKENIZATION_TIMEOUT");
+import software.amazon.awssdk.awscore.exception.AwsServiceException;
+import software.amazon.awssdk.core.exception.ApiCallAttemptTimeoutException;
+import software.amazon.awssdk.core.exception.ApiCallTimeoutException;
+import software.amazon.awssdk.core.exception.RetryableException;
+import software.amazon.awssdk.http.HttpExecuteException;
+import software.amazon.awssdk.services.sts.model.StsException;
+
+import javax.net.ssl.SSLException;
+import javax.net.ssl.SSLHandshakeException;
+
+import java.io.InterruptedIOException;
+import java.net.MalformedURLException;
+import java.net.NoRouteToHostException;
+import java.net.SocketException;
+import java.net.SocketTimeoutException;
+import java.net.URISyntaxException;
+import java.net.UnknownHostException;
+import java.security.cert.CertificateException;
+
+@Slf4j
+public final class TokenizationExceptionTranslator {
+
+    private TokenizationExceptionTranslator() {
     }
 
-    // THROTTLING
+    public static SdkException translate(Exception ex) {
 
-    if (ex instanceof AwsServiceException awsEx &&
-            awsEx.statusCode() == 429) {
+        log.error("Tokenization failure occurred", ex);
 
-        return new SdkException(
-                "429",
-                "Tokenization service throttling",
-                "TOKENIZATION_THROTTLED");
+        // AWS SERVICE EXCEPTIONS
+        // Handled separately because status code inspection is needed
+
+        if (ex instanceof AwsServiceException awsEx) {
+            return handleAwsServiceException(awsEx);
+        }
+
+        return switch (ex) {
+
+            // =========================================================
+            // TIMEOUT EXCEPTIONS
+            // =========================================================
+
+            case ConnectTimeoutException e,
+                 SocketTimeoutException e,
+                 ApiCallTimeoutException e,
+                 ApiCallAttemptTimeoutException e ->
+
+                    new SdkException(
+                            "408",
+                            "Timeout while calling tokenization service",
+                            "TOKENIZATION_TIMEOUT");
+
+            // =========================================================
+            // NETWORK / CONNECTIVITY FAILURES
+            // =========================================================
+
+            case UnknownHostException e,
+                 NoRouteToHostException e,
+                 HttpExecuteException e,
+                 ConnectionPoolTimeoutException e,
+                 RetryableException e,
+                 SocketException e ->
+
+                    new SdkException(
+                            "503",
+                            "Tokenization service unavailable",
+                            "TOKENIZATION_UNAVAILABLE");
+
+            // =========================================================
+            // SECURITY / SSL FAILURES
+            // =========================================================
+
+            case SSLHandshakeException e,
+                 SSLException e,
+                 CertificateException e,
+                 StsException e ->
+
+                    new SdkException(
+                            "401",
+                            "Secure communication failure with tokenization service",
+                            "TOKENIZATION_SECURITY_ERROR");
+
+            // =========================================================
+            // VALIDATION / PAYLOAD FAILURES
+            // =========================================================
+
+            case JsonProcessingException e,
+                 IllegalArgumentException e ->
+
+                    new SdkException(
+                            "400",
+                            "Invalid tokenization request",
+                            "TOKENIZATION_BAD_REQUEST");
+
+            // =========================================================
+            // CONFIGURATION FAILURES
+            // =========================================================
+
+            case URISyntaxException e,
+                 MalformedURLException e ->
+
+                    new SdkException(
+                            "500",
+                            "Tokenization configuration failure",
+                            "TOKENIZATION_CONFIGURATION_ERROR");
+
+            // =========================================================
+            // INTERRUPTED THREADS
+            // =========================================================
+
+            case InterruptedException e -> {
+
+                Thread.currentThread().interrupt();
+
+                yield new SdkException(
+                        "503",
+                        "Tokenization request interrupted",
+                        "TOKENIZATION_INTERRUPTED");
+            }
+
+            case InterruptedIOException e -> {
+
+                Thread.currentThread().interrupt();
+
+                yield new SdkException(
+                        "503",
+                        "Tokenization I/O interrupted",
+                        "TOKENIZATION_INTERRUPTED");
+            }
+
+            // =========================================================
+            // FALLBACK
+            // =========================================================
+
+            default -> new SdkException(
+                    "500",
+                    "Unexpected tokenization failure",
+                    "TOKENIZATION_INTERNAL_ERROR");
+        };
     }
 
-    // SERVER ERRORS
+    private static SdkException handleAwsServiceException(
+            AwsServiceException awsEx) {
 
-    if (ex instanceof AwsServiceException awsEx &&
-            awsEx.statusCode() >= 500) {
+        int statusCode = awsEx.statusCode();
 
-        return new SdkException(
-                String.valueOf(awsEx.statusCode()),
-                "Tokenization downstream service failure",
-                "TOKENIZATION_SERVER_ERROR");
-    }
+        log.error(
+                "AWS service exception occurred. statusCode={}, errorCode={}, message={}",
+                statusCode,
+                awsEx.awsErrorDetails() != null
+                        ? awsEx.awsErrorDetails().errorCode()
+                        : "UNKNOWN",
+                awsEx.getMessage(),
+                awsEx);
 
-    // NETWORK FAILURES
+        // =========================================================
+        // THROTTLING
+        // =========================================================
 
-    if (ex instanceof UnknownHostException ||
-        ex instanceof NoRouteToHostException ||
-        ex instanceof HttpExecuteException ||
-        ex instanceof ConnectionPoolTimeoutException ||
-        ex instanceof RetryableException ||
-        ex instanceof SocketException) {
+        if (statusCode == 429) {
 
-        return new SdkException(
-                "503",
-                "Tokenization service unavailable",
-                "TOKENIZATION_UNAVAILABLE");
-    }
+            return new SdkException(
+                    "429",
+                    "Tokenization service throttling",
+                    "TOKENIZATION_THROTTLED");
+        }
 
-    // SECURITY FAILURES
+        // =========================================================
+        // SERVER ERRORS
+        // =========================================================
 
-    if (ex instanceof SSLHandshakeException ||
-        ex instanceof SSLException ||
-        ex instanceof CertificateException ||
-        ex instanceof StsException) {
+        if (statusCode >= 500) {
 
-        return new SdkException(
-                "401",
-                "Secure communication failure with tokenization service",
-                "TOKENIZATION_SECURITY_ERROR");
-    }
+            return new SdkException(
+                    String.valueOf(statusCode),
+                    "Tokenization downstream service failure",
+                    "TOKENIZATION_SERVER_ERROR");
+        }
 
-    // VALIDATION / PAYLOAD FAILURES
+        // =========================================================
+        // AUTHORIZATION FAILURES
+        // =========================================================
 
-    if (ex instanceof JsonProcessingException ||
-        ex instanceof IllegalArgumentException) {
+        if (statusCode == 401 || statusCode == 403) {
 
-        return new SdkException(
-                "400",
-                "Invalid tokenization request",
-                "TOKENIZATION_BAD_REQUEST");
-    }
+            return new SdkException(
+                    String.valueOf(statusCode),
+                    "Unauthorized tokenization service request",
+                    "TOKENIZATION_AUTHORIZATION_ERROR");
+        }
 
-    // CONFIGURATION ISSUES
+        // =========================================================
+        // BAD REQUEST FAILURES
+        // =========================================================
 
-    if (ex instanceof URISyntaxException ||
-        ex instanceof MalformedURLException) {
+        if (statusCode >= 400) {
+
+            return new SdkException(
+                    String.valueOf(statusCode),
+                    "Invalid request sent to tokenization service",
+                    "TOKENIZATION_BAD_REQUEST");
+        }
+
+        // =========================================================
+        // FALLBACK
+        // =========================================================
 
         return new SdkException(
                 "500",
-                "Tokenization configuration failure",
-                "TOKENIZATION_CONFIGURATION_ERROR");
+                "Unexpected AWS tokenization service failure",
+                "TOKENIZATION_AWS_SERVICE_ERROR");
     }
-
-    // INTERRUPTED THREADS
-
-    if (ex instanceof InterruptedException ||
-        ex instanceof InterruptedIOException) {
-
-        Thread.currentThread().interrupt();
-
-        return new SdkException(
-                "503",
-                "Tokenization request interrupted",
-                "TOKENIZATION_INTERRUPTED");
-    }
-
-    // FALLBACK
-
-    return new SdkException(
-            "500",
-            "Unexpected tokenization failure",
-            "TOKENIZATION_INTERNAL_ERROR");
 }
 -----
 try {
